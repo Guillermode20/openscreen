@@ -167,12 +167,6 @@ export class VideoExporter {
       this.muxer = new VideoMuxer(this.config, this.hasAudio);
       await this.muxer.initialize();
 
-      // Get the video element for frame extraction
-      const videoElement = this.decoder.getVideoElement();
-      if (!videoElement) {
-        throw new Error('Video element not available');
-      }
-
       // Calculate effective duration and frame count (excluding trim regions)
       const effectiveDuration = this.getEffectiveDuration(videoInfo.duration);
       const totalFrames = Math.ceil(effectiveDuration * this.config.frameRate);
@@ -204,24 +198,12 @@ export class VideoExporter {
           // Don't go past segment end
           if (sourceTimeMs >= segment.endMs) break;
 
-          // Seek to frame timestamp
-          videoElement.currentTime = sourceTimeMs / 1000;
-          await new Promise<void>(resolve => {
-            const onSeeked = () => {
-              videoElement.removeEventListener('seeked', onSeeked);
-              resolve();
-            };
-            videoElement.addEventListener('seeked', onSeeked);
-          });
-
           const outputTimestamp = outputFrameIndex * frameDuration;
 
-          // Create VideoFrame from seeked video
-          let videoFrame: VideoFrame;
-          try {
-            videoFrame = new VideoFrame(videoElement, { timestamp: outputTimestamp });
-          } catch (e) {
-            console.warn(`[VideoExporter] Failed to create VideoFrame at ${sourceTimeMs}ms:`, e);
+          // Get frame from decoder
+          const videoFrame = await this.decoder!.getFrameAt(sourceTimeMs);
+          if (!videoFrame) {
+            console.warn(`[VideoExporter] Failed to get VideoFrame at ${sourceTimeMs}ms`);
             continue;
           }
 

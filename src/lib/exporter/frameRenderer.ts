@@ -108,7 +108,7 @@ export class FrameRenderer {
     this.blurFilter = new BlurFilter();
     this.blurFilter.quality = 3;
     this.blurFilter.resolution = this.app.renderer.resolution;
-    this.blurFilter.blur = 0;
+    this.blurFilter.strength = 0;
     this.videoContainer.filters = [this.blurFilter];
 
     // Setup composite canvas for final output
