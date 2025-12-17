@@ -60,13 +60,16 @@ function createHudOverlayWindow() {
   return win;
 }
 function createEditorWindow() {
+  const isMac = process.platform === "darwin";
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    titleBarStyle: "hiddenInset",
-    trafficLightPosition: { x: 12, y: 12 },
+    ...isMac && {
+      titleBarStyle: "hiddenInset",
+      trafficLightPosition: { x: 12, y: 12 }
+    },
     transparent: false,
     resizable: true,
     alwaysOnTop: false,
@@ -366,9 +369,7 @@ app.on("activate", () => {
 app.whenReady().then(async () => {
   const { ipcMain: ipcMain2 } = await import("electron");
   ipcMain2.on("hud-overlay-close", () => {
-    if (process.platform === "darwin") {
-      app.quit();
-    }
+    app.quit();
   });
   await ensureRecordingsDir();
   registerIpcHandlers(

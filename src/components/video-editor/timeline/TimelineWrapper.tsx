@@ -107,9 +107,12 @@ export default function TimelineWrapper({
 
   const onDragEnd = useCallback(
     (event: DragEndEvent) => {
-      const activeRowId = event.over?.id as string;
       const updatedSpan = event.active.data.current.getSpanFromDragEvent?.(event);
-      if (!updatedSpan || !activeRowId) return;
+      if (!updatedSpan) return;
+      
+      // Get rowId from the item's data if event.over is not available (can happen with multiple items)
+      const activeRowId = event.over?.id as string ?? event.active.data.current?.rowId as string;
+      if (!activeRowId) return;
       
       const activeItemId = event.active.id as string;
       const clampedSpan = clampSpanToBounds(updatedSpan);
