@@ -28,6 +28,7 @@ export class VideoExporter {
   private decoder: VideoFileDecoder | null = null;
   private renderer: FrameRenderer | null = null;
   private encoder: VideoEncoder | null = null;
+  private audioEncoder: AudioEncoder | null = null;
   private muxer: VideoMuxer | null = null;
   private cancelled = false;
   private encodeQueue = 0;
@@ -38,8 +39,12 @@ export class VideoExporter {
   // Track muxing promises for parallel processing
   private muxingPromises: Promise<void>[] = [];
   private chunkCount = 0;
+  private audioChunkCount = 0;
   // Promise-based encoder queue signaling
   private encodeQueueResolvers: Array<() => void> = [];
+  // Audio buffer for the source video
+  private audioBuffer: AudioBuffer | null = null;
+  private hasAudio = false;
 
   constructor(config: VideoExporterConfig) {
     this.config = config;
@@ -150,8 +155,16 @@ export class VideoExporter {
       // Initialize video encoder
       await this.initializeEncoder();
 
-      // Initialize muxer
-      this.muxer = new VideoMuxer(this.config, false);
+      // Extract audio from source video
+      await this.extractAudio();
+
+      // Initialize audio encoder if we have audio
+      if (this.hasAudio) {
+        await this.initializeAudioEncoder();
+      }
+
+      // Initialize muxer with audio support
+      this.muxer = new VideoMuxer(this.config, this.hasAudio);
       await this.muxer.initialize();
 
       // Get the video element for frame extraction
@@ -176,98 +189,90 @@ export class VideoExporter {
       const frameIntervalMs = 1000 / this.config.frameRate;
       let outputFrameIndex = 0;
 
-      // Process each segment by playing the video and capturing frames
+      // Process each segment by seeking to each frame timestamp
       for (let segIdx = 0; segIdx < segments.length && !this.cancelled; segIdx++) {
         const segment = segments[segIdx];
         console.log(`[VideoExporter] Segment ${segIdx + 1}: ${segment.startMs}ms - ${segment.endMs}ms`);
 
-        // Seek to segment start
-        videoElement.currentTime = segment.startMs / 1000;
-        await new Promise<void>(resolve => {
-          videoElement.addEventListener('seeked', resolve, { once: true });
-        });
+        // Calculate frames for this segment
+        const segmentDurationMs = segment.endMs - segment.startMs;
+        const segmentFrameCount = Math.ceil(segmentDurationMs / frameIntervalMs);
 
-        // Play the video for this segment
-        videoElement.playbackRate = 1.0;
-        await videoElement.play();
+        for (let frameIdx = 0; frameIdx < segmentFrameCount && !this.cancelled; frameIdx++) {
+          const sourceTimeMs = segment.startMs + (frameIdx * frameIntervalMs);
+          
+          // Don't go past segment end
+          if (sourceTimeMs >= segment.endMs) break;
 
-        let lastCaptureTimeMs = segment.startMs - frameIntervalMs;
+          // Seek to frame timestamp
+          videoElement.currentTime = sourceTimeMs / 1000;
+          await new Promise<void>(resolve => {
+            const onSeeked = () => {
+              videoElement.removeEventListener('seeked', onSeeked);
+              resolve();
+            };
+            videoElement.addEventListener('seeked', onSeeked);
+          });
 
-        // Capture frames while playing through this segment
-        while (!this.cancelled) {
-          const currentTimeMs = videoElement.currentTime * 1000;
+          const outputTimestamp = outputFrameIndex * frameDuration;
 
-          // Check if we've reached the end of this segment
-          if (currentTimeMs >= segment.endMs - 1) {
-            break;
+          // Create VideoFrame from seeked video
+          let videoFrame: VideoFrame;
+          try {
+            videoFrame = new VideoFrame(videoElement, { timestamp: outputTimestamp });
+          } catch (e) {
+            console.warn(`[VideoExporter] Failed to create VideoFrame at ${sourceTimeMs}ms:`, e);
+            continue;
           }
 
-          // Check if it's time to capture a frame
-          const timeSinceLastCapture = currentTimeMs - lastCaptureTimeMs;
-          
-          if (timeSinceLastCapture >= frameIntervalMs * 0.95) {
-            const outputTimestamp = outputFrameIndex * frameDuration;
+          // Render frame with effects
+          const sourceTimestamp = sourceTimeMs * 1000; // convert to microseconds
+          await this.renderer!.renderFrame(videoFrame, sourceTimestamp);
+          videoFrame.close();
 
-            // Create VideoFrame from playing video
-            let videoFrame: VideoFrame;
-            try {
-              videoFrame = new VideoFrame(videoElement, { timestamp: outputTimestamp });
-            } catch {
-              // Frame not ready, wait a tiny bit and continue
-              await new Promise(r => setTimeout(r, 1));
-              continue;
-            }
+          // Create export frame from rendered canvas
+          const canvas = this.renderer!.getCanvas();
+          // @ts-ignore
+          const exportFrame = new VideoFrame(canvas, {
+            timestamp: outputTimestamp,
+            duration: frameDuration,
+            colorSpace: { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+          });
 
-            // Render frame with effects
-            const sourceTimestamp = currentTimeMs * 1000;
-            await this.renderer!.renderFrame(videoFrame, sourceTimestamp);
-            videoFrame.close();
+          // Encode
+          await this.waitForEncoderQueue();
+          if (this.encoder?.state === 'configured') {
+            this.encodeQueue++;
+            this.encoder.encode(exportFrame, { keyFrame: outputFrameIndex % 150 === 0 });
+          }
+          exportFrame.close();
 
-            // Create export frame from rendered canvas
-            const canvas = this.renderer!.getCanvas();
-            // @ts-ignore
-            const exportFrame = new VideoFrame(canvas, {
-              timestamp: outputTimestamp,
-              duration: frameDuration,
-              colorSpace: { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+          outputFrameIndex++;
+
+          // Update progress
+          if (this.config.onProgress) {
+            this.config.onProgress({
+              currentFrame: outputFrameIndex,
+              totalFrames,
+              percentage: (outputFrameIndex / totalFrames) * 100,
+              estimatedTimeRemaining: 0,
             });
-
-            // Encode
-            await this.waitForEncoderQueue();
-            if (this.encoder?.state === 'configured') {
-              this.encodeQueue++;
-              this.encoder.encode(exportFrame, { keyFrame: outputFrameIndex % 150 === 0 });
-            }
-            exportFrame.close();
-
-            lastCaptureTimeMs = currentTimeMs;
-            outputFrameIndex++;
-
-            // Update progress
-            if (this.config.onProgress) {
-              this.config.onProgress({
-                currentFrame: outputFrameIndex,
-                totalFrames,
-                percentage: (outputFrameIndex / totalFrames) * 100,
-                estimatedTimeRemaining: 0,
-              });
-            }
-          } else {
-            // Not time for next frame yet, yield to let video advance
-            await new Promise(r => setTimeout(r, 1));
           }
         }
-
-        videoElement.pause();
       }
 
       if (this.cancelled) {
         return { success: false, error: 'Export cancelled' };
       }
 
-      // Finalize encoding
+      // Finalize video encoding
       if (this.encoder && this.encoder.state === 'configured') {
         await this.encoder.flush();
+      }
+
+      // Encode audio (using the same segments to respect trim regions)
+      if (this.hasAudio) {
+        await this.encodeAudio(segments);
       }
 
       // Wait for all muxing operations to complete
@@ -387,6 +392,189 @@ export class VideoExporter {
     }
   }
 
+  private async extractAudio(): Promise<void> {
+    try {
+      console.log('[VideoExporter] Extracting audio from source video...');
+      
+      // Fetch the video file as ArrayBuffer
+      const response = await fetch(this.config.videoUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      
+      // Decode audio using Web Audio API
+      const audioContext = new AudioContext();
+      try {
+        this.audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        this.hasAudio = this.audioBuffer.numberOfChannels > 0;
+        console.log('[VideoExporter] Audio extracted:', {
+          channels: this.audioBuffer.numberOfChannels,
+          sampleRate: this.audioBuffer.sampleRate,
+          duration: this.audioBuffer.duration,
+        });
+      } catch (e) {
+        console.log('[VideoExporter] No audio track in video or failed to decode:', e);
+        this.hasAudio = false;
+      } finally {
+        await audioContext.close();
+      }
+    } catch (e) {
+      console.warn('[VideoExporter] Failed to extract audio:', e);
+      this.hasAudio = false;
+    }
+  }
+
+  private async initializeAudioEncoder(): Promise<void> {
+    if (!this.audioBuffer) return;
+
+    this.audioChunkCount = 0;
+
+    this.audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => {
+        const isFirstChunk = this.audioChunkCount === 0;
+        this.audioChunkCount++;
+
+        const muxingPromise = (async () => {
+          try {
+            if (isFirstChunk) {
+              const metadata: EncodedAudioChunkMetadata = {
+                decoderConfig: {
+                  codec: 'opus',
+                  sampleRate: 48000,
+                  numberOfChannels: 2,
+                },
+              };
+              await this.muxer!.addAudioChunk(chunk, metadata);
+            } else {
+              await this.muxer!.addAudioChunk(chunk, meta);
+            }
+          } catch (error) {
+            console.error('[VideoExporter] Audio muxing error:', error);
+          }
+        })();
+
+        this.muxingPromises.push(muxingPromise);
+      },
+      error: (error) => {
+        console.error('[VideoExporter] Audio encoder error:', error);
+      },
+    });
+
+    const audioConfig: AudioEncoderConfig = {
+      codec: 'opus',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      bitrate: 128000,
+    };
+
+    const support = await AudioEncoder.isConfigSupported(audioConfig);
+    if (!support.supported) {
+      console.warn('[VideoExporter] Opus audio encoding not supported, trying AAC');
+      // Try AAC as fallback
+      audioConfig.codec = 'mp4a.40.2';
+      const aacSupport = await AudioEncoder.isConfigSupported(audioConfig);
+      if (!aacSupport.supported) {
+        console.warn('[VideoExporter] Audio encoding not supported, proceeding without audio');
+        this.hasAudio = false;
+        return;
+      }
+    }
+
+    this.audioEncoder.configure(audioConfig);
+    console.log('[VideoExporter] Audio encoder initialized');
+  }
+
+  private async encodeAudio(segments: Array<{ startMs: number; endMs: number }>): Promise<void> {
+    if (!this.audioBuffer || !this.audioEncoder || !this.hasAudio) return;
+
+    console.log('[VideoExporter] Encoding audio...');
+    const sampleRate = this.audioBuffer.sampleRate;
+    const numberOfChannels = this.audioBuffer.numberOfChannels;
+    
+    // Target sample rate for output (matching encoder config)
+    const targetSampleRate = 48000;
+    const targetChannels = 2;
+    
+    let outputTimestampUs = 0;
+
+    for (const segment of segments) {
+      const startSample = Math.floor((segment.startMs / 1000) * sampleRate);
+      const endSample = Math.floor((segment.endMs / 1000) * sampleRate);
+      const segmentSamples = endSample - startSample;
+      
+      if (segmentSamples <= 0) continue;
+
+      // Extract audio data for this segment
+      const channelData: Float32Array[] = [];
+      for (let ch = 0; ch < numberOfChannels; ch++) {
+        const fullChannel = this.audioBuffer.getChannelData(ch);
+        channelData.push(fullChannel.slice(startSample, endSample));
+      }
+
+      // Resample if necessary and convert to target format
+      const resampleRatio = targetSampleRate / sampleRate;
+      const outputSamples = Math.floor(segmentSamples * resampleRatio);
+      
+      // Create interleaved audio data for AudioData
+      const outputData = new Float32Array(outputSamples * targetChannels);
+      
+      for (let i = 0; i < outputSamples; i++) {
+        const srcIndex = Math.floor(i / resampleRatio);
+        for (let ch = 0; ch < targetChannels; ch++) {
+          const srcChannel = ch < numberOfChannels ? ch : 0; // Mono to stereo: duplicate
+          const value = channelData[srcChannel][Math.min(srcIndex, channelData[srcChannel].length - 1)] || 0;
+          outputData[i * targetChannels + ch] = value;
+        }
+      }
+
+      // Encode in chunks (960 samples per frame for Opus at 48kHz = 20ms)
+      const samplesPerFrame = 960;
+      const framesInSegment = Math.ceil(outputSamples / samplesPerFrame);
+      
+      for (let frameIdx = 0; frameIdx < framesInSegment; frameIdx++) {
+        const frameStart = frameIdx * samplesPerFrame;
+        const frameEnd = Math.min(frameStart + samplesPerFrame, outputSamples);
+        const frameSamples = frameEnd - frameStart;
+        
+        if (frameSamples <= 0) continue;
+
+        // Create frame data
+        const frameData = new Float32Array(samplesPerFrame * targetChannels);
+        for (let i = 0; i < frameSamples * targetChannels; i++) {
+          frameData[i] = outputData[frameStart * targetChannels + i] || 0;
+        }
+
+        const audioData = new AudioData({
+          format: 'f32-planar',
+          sampleRate: targetSampleRate,
+          numberOfFrames: samplesPerFrame,
+          numberOfChannels: targetChannels,
+          timestamp: outputTimestampUs,
+          data: this.interleavedToPlanar(frameData, targetChannels, samplesPerFrame).buffer as ArrayBuffer,
+        });
+
+        this.audioEncoder.encode(audioData);
+        audioData.close();
+
+        outputTimestampUs += (samplesPerFrame / targetSampleRate) * 1_000_000;
+      }
+    }
+
+    // Flush audio encoder
+    if (this.audioEncoder.state === 'configured') {
+      await this.audioEncoder.flush();
+    }
+    console.log('[VideoExporter] Audio encoding complete');
+  }
+
+  private interleavedToPlanar(interleaved: Float32Array, channels: number, frames: number): Float32Array {
+    const planar = new Float32Array(channels * frames);
+    for (let ch = 0; ch < channels; ch++) {
+      for (let i = 0; i < frames; i++) {
+        planar[ch * frames + i] = interleaved[i * channels + ch] || 0;
+      }
+    }
+    return planar;
+  }
+
   cancel(): void {
     this.cancelled = true;
     this.cleanup();
@@ -402,6 +590,17 @@ export class VideoExporter {
         console.warn('Error closing encoder:', e);
       }
       this.encoder = null;
+    }
+
+    if (this.audioEncoder) {
+      try {
+        if (this.audioEncoder.state === 'configured') {
+          this.audioEncoder.close();
+        }
+      } catch (e) {
+        console.warn('Error closing audio encoder:', e);
+      }
+      this.audioEncoder = null;
     }
 
     if (this.decoder) {
@@ -426,8 +625,11 @@ export class VideoExporter {
     this.encodeQueue = 0;
     this.muxingPromises = [];
     this.chunkCount = 0;
+    this.audioChunkCount = 0;
     this.videoDescription = undefined;
     this.videoColorSpace = undefined;
+    this.audioBuffer = null;
+    this.hasAudio = false;
     // Clear any pending queue resolvers
     this.encodeQueueResolvers.forEach(resolve => resolve());
     this.encodeQueueResolvers = [];
