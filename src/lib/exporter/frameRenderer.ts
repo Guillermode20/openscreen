@@ -50,6 +50,12 @@ export class FrameRenderer {
   private animationState: AnimationState;
   private layoutCache: any = null;
   private currentVideoTime = 0;
+  // Cached pre-rendered background (with blur if enabled)
+  private cachedBackground: ImageBitmap | null = null;
+  // Reusable canvas for video frame texture updates (avoids texture recreation)
+  private videoFrameCanvas: HTMLCanvasElement | null = null;
+  private videoFrameCtx: CanvasRenderingContext2D | null = null;
+  private videoTexture: Texture | null = null;
 
   constructor(config: FrameRenderConfig) {
     this.config = config;
@@ -98,14 +104,14 @@ export class FrameRenderer {
     // Setup background (render separately, not in PixiJS)
     await this.setupBackground();
 
-    // Setup blur filter for video container
+    // Setup blur filter for video container (motion blur)
     this.blurFilter = new BlurFilter();
     this.blurFilter.quality = 3;
     this.blurFilter.resolution = this.app.renderer.resolution;
     this.blurFilter.blur = 0;
     this.videoContainer.filters = [this.blurFilter];
 
-    // Setup composite canvas for final output with shadows
+    // Setup composite canvas for final output
     this.compositeCanvas = document.createElement('canvas');
     this.compositeCanvas.width = this.config.width;
     this.compositeCanvas.height = this.config.height;
@@ -248,6 +254,21 @@ export class FrameRenderer {
 
     // Store the background canvas for compositing
     this.backgroundSprite = bgCanvas as any;
+
+    // Pre-render the background with blur if enabled (cache it once)
+    if (this.config.showBlur) {
+      const blurredCanvas = document.createElement('canvas');
+      blurredCanvas.width = this.config.width;
+      blurredCanvas.height = this.config.height;
+      const blurredCtx = blurredCanvas.getContext('2d')!;
+      blurredCtx.filter = 'blur(6px)';
+      blurredCtx.drawImage(bgCanvas, 0, 0);
+      // Create ImageBitmap for faster drawing
+      this.cachedBackground = await createImageBitmap(blurredCanvas);
+    } else {
+      // Cache unblurred background as ImageBitmap for faster drawing
+      this.cachedBackground = await createImageBitmap(bgCanvas);
+    }
   }
 
   async renderFrame(videoFrame: VideoFrame, timestamp: number): Promise<void> {
@@ -257,17 +278,27 @@ export class FrameRenderer {
 
     this.currentVideoTime = timestamp / 1000000;
 
-    // Create or update video sprite from VideoFrame
-    if (!this.videoSprite) {
-      const texture = Texture.from(videoFrame as any);
-      this.videoSprite = new Sprite(texture);
+    // Initialize video frame canvas on first use (matches video dimensions)
+    if (!this.videoFrameCanvas) {
+      this.videoFrameCanvas = document.createElement('canvas');
+      this.videoFrameCanvas.width = videoFrame.displayWidth;
+      this.videoFrameCanvas.height = videoFrame.displayHeight;
+      this.videoFrameCtx = this.videoFrameCanvas.getContext('2d', { willReadFrequently: false });
+    }
+
+    // Draw VideoFrame to reusable canvas
+    if (this.videoFrameCtx) {
+      this.videoFrameCtx.drawImage(videoFrame, 0, 0);
+    }
+
+    // Create texture and sprite on first frame, then update texture source
+    if (!this.videoSprite || !this.videoTexture) {
+      this.videoTexture = Texture.from(this.videoFrameCanvas!);
+      this.videoSprite = new Sprite(this.videoTexture);
       this.videoContainer.addChild(this.videoSprite);
     } else {
-      // Destroy old texture to avoid memory leaks, then create new one
-      const oldTexture = this.videoSprite.texture;
-      const newTexture = Texture.from(videoFrame as any);
-      this.videoSprite.texture = newTexture;
-      oldTexture.destroy(true);
+      // Update existing texture source in-place (avoids recreation)
+      this.videoTexture.source.update();
     }
 
     // Apply layout
@@ -464,39 +495,30 @@ export class FrameRenderer {
     // Clear composite canvas
     ctx.clearRect(0, 0, w, h);
 
-    // Step 1: Draw background layer (with optional blur, not affected by zoom)
-    if (this.backgroundSprite) {
+    // Step 1: Draw cached background (pre-rendered with blur if enabled)
+    if (this.cachedBackground) {
+      ctx.drawImage(this.cachedBackground, 0, 0, w, h);
+    } else if (this.backgroundSprite) {
+      // Fallback to original background canvas if cache not available
       const bgCanvas = this.backgroundSprite as any as HTMLCanvasElement;
-      
-      if (this.config.showBlur) {
-        ctx.save();
-        ctx.filter = 'blur(6px)'; // Canvas blur is weaker than CSS
-        ctx.drawImage(bgCanvas, 0, 0, w, h);
-        ctx.restore();
-      } else {
-        ctx.drawImage(bgCanvas, 0, 0, w, h);
-      }
+      ctx.drawImage(bgCanvas, 0, 0, w, h);
     } else {
-      console.warn('[FrameRenderer] No background sprite found during compositing!');
+      console.warn('[FrameRenderer] No background found during compositing!');
     }
 
-    // Draw video layer with shadows on top of background
+    // Step 2: Draw video layer with shadows on top of background
     if (this.config.showShadow && this.config.shadowIntensity > 0 && this.shadowCanvas && this.shadowCtx) {
       const shadowCtx = this.shadowCtx;
       shadowCtx.clearRect(0, 0, w, h);
       shadowCtx.save();
       
-      // Calculate shadow parameters based on intensity (0-1)
+      // Optimized shadow: use single drop-shadow filter instead of 3 for better performance
       const intensity = this.config.shadowIntensity;
-      const baseBlur1 = 48 * intensity;
-      const baseBlur2 = 16 * intensity;
-      const baseBlur3 = 8 * intensity;
-      const baseAlpha1 = 0.7 * intensity;
-      const baseAlpha2 = 0.5 * intensity;
-      const baseAlpha3 = 0.3 * intensity;
-      const baseOffset = 12 * intensity;
+      const blur = 32 * intensity;
+      const offset = 8 * intensity;
+      const alpha = 0.6 * intensity;
       
-      shadowCtx.filter = `drop-shadow(0 ${baseOffset}px ${baseBlur1}px rgba(0,0,0,${baseAlpha1})) drop-shadow(0 ${baseOffset/3}px ${baseBlur2}px rgba(0,0,0,${baseAlpha2})) drop-shadow(0 ${baseOffset/6}px ${baseBlur3}px rgba(0,0,0,${baseAlpha3}))`;
+      shadowCtx.filter = `drop-shadow(0 ${offset}px ${blur}px rgba(0,0,0,${alpha}))`;
       shadowCtx.drawImage(videoCanvas, 0, 0, w, h);
       shadowCtx.restore();
       ctx.drawImage(this.shadowCanvas, 0, 0, w, h);
@@ -518,7 +540,17 @@ export class FrameRenderer {
       this.videoSprite.destroy();
       this.videoSprite = null;
     }
+    if (this.videoTexture) {
+      this.videoTexture.destroy(true);
+      this.videoTexture = null;
+    }
+    this.videoFrameCanvas = null;
+    this.videoFrameCtx = null;
     this.backgroundSprite = null;
+    if (this.cachedBackground) {
+      this.cachedBackground.close();
+      this.cachedBackground = null;
+    }
     if (this.app) {
       this.app.destroy(true, { children: true, texture: true, textureSource: true });
       this.app = null;

@@ -38,9 +38,53 @@ export class VideoExporter {
   // Track muxing promises for parallel processing
   private muxingPromises: Promise<void>[] = [];
   private chunkCount = 0;
+  // Promise-based encoder queue signaling
+  private encodeQueueResolvers: Array<() => void> = [];
 
   constructor(config: VideoExporterConfig) {
     this.config = config;
+  }
+
+  // Build playback segments excluding trim regions
+  private buildPlaybackSegments(totalDuration: number): Array<{ startMs: number; endMs: number }> {
+    const trimRegions = this.config.trimRegions || [];
+    const sortedTrims = [...trimRegions].sort((a, b) => a.startMs - b.startMs);
+    
+    const segments: Array<{ startMs: number; endMs: number }> = [];
+    let currentStart = 0;
+    
+    for (const trim of sortedTrims) {
+      if (trim.startMs > currentStart) {
+        segments.push({ startMs: currentStart, endMs: trim.startMs });
+      }
+      currentStart = trim.endMs;
+    }
+    
+    // Add final segment after last trim
+    const totalMs = totalDuration * 1000;
+    if (currentStart < totalMs) {
+      segments.push({ startMs: currentStart, endMs: totalMs });
+    }
+    
+    return segments;
+  }
+
+  // Signal that encoder queue has space
+  private signalEncoderQueueSpace(): void {
+    while (this.encodeQueueResolvers.length > 0 && this.encodeQueue < this.MAX_ENCODE_QUEUE) {
+      const resolver = this.encodeQueueResolvers.shift();
+      resolver?.();
+    }
+  }
+
+  // Wait for encoder queue to have space
+  private waitForEncoderQueue(): Promise<void> {
+    if (this.encodeQueue < this.MAX_ENCODE_QUEUE) {
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => {
+      this.encodeQueueResolvers.push(resolve);
+    });
   }
 
   // Calculate the total duration excluding trim regions (in seconds)
@@ -124,89 +168,97 @@ export class VideoExporter {
       console.log('[VideoExporter] Effective duration:', effectiveDuration, 's');
       console.log('[VideoExporter] Total frames to export:', totalFrames);
 
-      // Process frames continuously without batching delays
+      // Build playback segments (parts of video to include, excluding trims)
+      const segments = this.buildPlaybackSegments(videoInfo.duration);
+      console.log('[VideoExporter] Processing', segments.length, 'segment(s)');
+
       const frameDuration = 1_000_000 / this.config.frameRate; // in microseconds
-      let frameIndex = 0;
-      const timeStep = 1 / this.config.frameRate;
+      const frameIntervalMs = 1000 / this.config.frameRate;
+      let outputFrameIndex = 0;
 
-      while (frameIndex < totalFrames && !this.cancelled) {
-        const i = frameIndex;
-        const timestamp = i * frameDuration;
+      // Process each segment by playing the video and capturing frames
+      for (let segIdx = 0; segIdx < segments.length && !this.cancelled; segIdx++) {
+        const segment = segments[segIdx];
+        console.log(`[VideoExporter] Segment ${segIdx + 1}: ${segment.startMs}ms - ${segment.endMs}ms`);
 
-        // Map effective time to source time (accounting for trim regions)
-        const effectiveTimeMs = (i * timeStep) * 1000;
-        const sourceTimeMs = this.mapEffectiveToSourceTime(effectiveTimeMs);
-        const videoTime = sourceTimeMs / 1000;
-          
-        // Seek if needed or wait for first frame to be ready
-        const needsSeek = Math.abs(videoElement.currentTime - videoTime) > 0.001;
-
-        if (needsSeek) {
-          // Attach listener BEFORE setting currentTime to avoid race condition
-          const seekedPromise = new Promise<void>(resolve => {
-            videoElement.addEventListener('seeked', () => resolve(), { once: true });
-          });
-          
-          videoElement.currentTime = videoTime;
-          await seekedPromise;
-        } else if (i === 0) {
-          // Only for the very first frame, wait for it to be ready
-          await new Promise<void>(resolve => {
-            videoElement.requestVideoFrameCallback(() => resolve());
-          });
-        }
-
-        // Create a VideoFrame from the video element (on GPU!)
-        const videoFrame = new VideoFrame(videoElement, {
-          timestamp,
+        // Seek to segment start
+        videoElement.currentTime = segment.startMs / 1000;
+        await new Promise<void>(resolve => {
+          videoElement.addEventListener('seeked', resolve, { once: true });
         });
 
-        // Render the frame with all effects using source timestamp
-        const sourceTimestamp = sourceTimeMs * 1000; // Convert to microseconds
-        await this.renderer!.renderFrame(videoFrame, sourceTimestamp);
-        
-        videoFrame.close();
+        // Play the video for this segment
+        videoElement.playbackRate = 1.0;
+        await videoElement.play();
 
-        const canvas = this.renderer!.getCanvas();
+        let lastCaptureTimeMs = segment.startMs - frameIntervalMs;
 
-        // Create VideoFrame from canvas on GPU without reading pixels
-        // @ts-ignore - colorSpace not in TypeScript definitions but works at runtime
-        const exportFrame = new VideoFrame(canvas, {
-          timestamp,
-          duration: frameDuration,
-          colorSpace: {
-            primaries: 'bt709',
-            transfer: 'iec61966-2-1',
-            matrix: 'rgb',
-            fullRange: true,
-          },
-        });
+        // Capture frames while playing through this segment
+        while (!this.cancelled) {
+          const currentTimeMs = videoElement.currentTime * 1000;
 
-        // Check encoder queue before encoding to keep it full
-        while (this.encodeQueue >= this.MAX_ENCODE_QUEUE && !this.cancelled) {
-          await new Promise(resolve => setTimeout(resolve, 0));
+          // Check if we've reached the end of this segment
+          if (currentTimeMs >= segment.endMs - 1) {
+            break;
+          }
+
+          // Check if it's time to capture a frame
+          const timeSinceLastCapture = currentTimeMs - lastCaptureTimeMs;
+          
+          if (timeSinceLastCapture >= frameIntervalMs * 0.95) {
+            const outputTimestamp = outputFrameIndex * frameDuration;
+
+            // Create VideoFrame from playing video
+            let videoFrame: VideoFrame;
+            try {
+              videoFrame = new VideoFrame(videoElement, { timestamp: outputTimestamp });
+            } catch {
+              // Frame not ready, wait a tiny bit and continue
+              await new Promise(r => setTimeout(r, 1));
+              continue;
+            }
+
+            // Render frame with effects
+            const sourceTimestamp = currentTimeMs * 1000;
+            await this.renderer!.renderFrame(videoFrame, sourceTimestamp);
+            videoFrame.close();
+
+            // Create export frame from rendered canvas
+            const canvas = this.renderer!.getCanvas();
+            // @ts-ignore
+            const exportFrame = new VideoFrame(canvas, {
+              timestamp: outputTimestamp,
+              duration: frameDuration,
+              colorSpace: { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+            });
+
+            // Encode
+            await this.waitForEncoderQueue();
+            if (this.encoder?.state === 'configured') {
+              this.encodeQueue++;
+              this.encoder.encode(exportFrame, { keyFrame: outputFrameIndex % 150 === 0 });
+            }
+            exportFrame.close();
+
+            lastCaptureTimeMs = currentTimeMs;
+            outputFrameIndex++;
+
+            // Update progress
+            if (this.config.onProgress) {
+              this.config.onProgress({
+                currentFrame: outputFrameIndex,
+                totalFrames,
+                percentage: (outputFrameIndex / totalFrames) * 100,
+                estimatedTimeRemaining: 0,
+              });
+            }
+          } else {
+            // Not time for next frame yet, yield to let video advance
+            await new Promise(r => setTimeout(r, 1));
+          }
         }
 
-        if (this.encoder && this.encoder.state === 'configured') {
-          this.encodeQueue++;
-          this.encoder.encode(exportFrame, { keyFrame: i % 150 === 0 });
-        } else {
-          console.warn(`[Frame ${i}] Encoder not ready! State: ${this.encoder?.state}`);
-        }
-
-        exportFrame.close();
-
-        frameIndex++;
-
-        // Update progress
-        if (this.config.onProgress) {
-          this.config.onProgress({
-            currentFrame: frameIndex,
-            totalFrames,
-            percentage: (frameIndex / totalFrames) * 100,
-            estimatedTimeRemaining: 0,
-          });
-        }
+        videoElement.pause();
       }
 
       if (this.cancelled) {
@@ -291,6 +343,8 @@ export class VideoExporter {
 
         this.muxingPromises.push(muxingPromise);
         this.encodeQueue--;
+        // Signal that encoder queue has space
+        this.signalEncoderQueueSpace();
       },
       error: (error) => {
         console.error('[VideoExporter] Encoder error:', error);
@@ -374,5 +428,8 @@ export class VideoExporter {
     this.chunkCount = 0;
     this.videoDescription = undefined;
     this.videoColorSpace = undefined;
+    // Clear any pending queue resolvers
+    this.encodeQueueResolvers.forEach(resolve => resolve());
+    this.encodeQueueResolvers = [];
   }
 }

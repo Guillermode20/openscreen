@@ -13,10 +13,12 @@ export class VideoFileDecoder {
   async loadVideo(videoUrl: string): Promise<DecodedVideoInfo> {
     this.videoElement = document.createElement('video');
     this.videoElement.src = videoUrl;
-    this.videoElement.preload = 'metadata';
+    this.videoElement.preload = 'auto'; // Preload video data for VideoFrame creation
+    this.videoElement.muted = true; // Mute to allow autoplay policies
 
     return new Promise((resolve, reject) => {
-      this.videoElement!.addEventListener('loadedmetadata', () => {
+      // Wait for enough data to be loaded for frame extraction
+      this.videoElement!.addEventListener('canplay', () => {
         const video = this.videoElement!;
         
         this.info = {
@@ -28,7 +30,7 @@ export class VideoFileDecoder {
         };
 
         resolve(this.info);
-      });
+      }, { once: true });
 
       this.videoElement!.addEventListener('error', (e) => {
         reject(new Error(`Failed to load video: ${e}`));
